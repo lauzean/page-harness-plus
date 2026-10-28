@@ -7,8 +7,10 @@ import type {
   AskAnswer,
   ChatEvent,
   ChatEventBody,
+  ChatImport,
   ChatMeta,
   ChatSnapshot,
+  ClaudeSessionInfo,
   ClientMsg,
   HarnessMode,
   LiveRequest,
@@ -36,6 +38,7 @@ import { MAX_REVIEW_ITEMS, type ReviewStore } from './review'
 import type { Who } from './auth'
 import type { Team } from './team'
 import { buildPrompt } from './prompt'
+import { claudeTurnsToEvents, parseClaudeSession, scanClaudeSessions } from './claudeSessions'
 import { ChatStore } from './store'
 import type { Uploads } from './uploads'
 
@@ -327,6 +330,122 @@ export class Gateway {
       if (t.files.length) out.push('', 'Changed files: ' + t.files.map((f) => `\`${f}\``).join(', '), '')
     }
     return out.join('\n')
+  }
+
+  // ---------- Claude Code sessions ----------
+
+  /** 列出当前项目在 ~/.claude/projects 下的会话，并标记哪些已经导入过。 */
+  async listClaudeSessions(): Promise<ClaudeSessionInfo[]> {
+    const sessions = await scanClaudeSessions(this.o.project)
+    const imported = this.importedChatsBySession()
+    return sessions.map((s) => {
+      const chat = imported.get(s.sessionId)
+      const imp = chat?.meta.importedFrom
+      const turns = chat ? chat.load().turns.length : 0
+      // 导入后在 Page Harness 里继续过，轮次会比导入时更多。
+      const continued = !!imp && turns > imp.turns
+      const upToDate = !!imp && imp.sizeBytes === s.sizeBytes && imp.mtimeMs === s.mtimeMs
+      return {
+        sessionId: s.sessionId,
+        title: s.title,
+        preview: s.preview,
+        createdAt: s.createdAt,
+        updatedAt: s.updatedAt,
+        turns: s.turns,
+        sizeBytes: s.sizeBytes,
+        cwd: s.cwd,
+        gitBranch: s.gitBranch,
+        importedChatId: chat?.meta.id,
+        importedTurns: imp?.turns,
+        upToDate,
+        continued,
+      }
+    })
+  }
+
+  /**
+   * 把一个或多个 Claude 会话导入为聊天记录。
+   * - 未导入：新建对话，agentSessionId 指向原会话，之后可直接续聊。
+   * - 已导入且会话文件有更新：重写事件日志（仅当没有在 Page Harness 里继续过）。
+   * - 已继续过：跳过，避免覆盖新对话。
+   */
+  async syncClaudeSessions(ids?: string[]): Promise<{ chats: ChatMeta[]; skipped: Array<{ sessionId: string; reason: 'continued' | 'running' | 'empty' }> }> {
+    const sessions = await scanClaudeSessions(this.o.project)
+    const wanted = ids ? new Set(ids) : null
+    const imported = this.importedChatsBySession()
+    const chats: ChatMeta[] = []
+    const skipped: Array<{ sessionId: string; reason: 'continued' | 'running' | 'empty' }> = []
+
+    for (const s of sessions) {
+      if (wanted && !wanted.has(s.sessionId)) continue
+      const existing = imported.get(s.sessionId)?.load()
+      const imp = existing?.meta.importedFrom
+      if (existing && imp) {
+        if (existing.running) {
+          skipped.push({ sessionId: s.sessionId, reason: 'running' })
+          continue
+        }
+        if (existing.turns.length > imp.turns) {
+          skipped.push({ sessionId: s.sessionId, reason: 'continued' })
+          continue
+        }
+        // 文件没有变化：无需重写，直接返回，方便前端选中。
+        if (imp.sizeBytes === s.sizeBytes && imp.mtimeMs === s.mtimeMs) {
+          chats.push(existing.meta)
+          continue
+        }
+      }
+      const parsed = await parseClaudeSession(s.file)
+      if (!parsed.turns.length) {
+        skipped.push({ sessionId: s.sessionId, reason: 'empty' })
+        continue
+      }
+      const chatId = existing?.meta.id ?? newId('c_')
+      const importedFrom: ChatImport = {
+        source: 'claude',
+        sessionId: parsed.sessionId,
+        file: parsed.file,
+        sizeBytes: parsed.sizeBytes,
+        mtimeMs: parsed.mtimeMs,
+        turns: parsed.turns.length,
+        syncedAt: Date.now(),
+      }
+      const meta: ChatMeta = {
+        id: chatId,
+        title: parsed.title,
+        agent: 'claude',
+        createdAt: parsed.createdAt,
+        updatedAt: parsed.updatedAt,
+        turns: parsed.turns.length,
+        agentSessionId: parsed.sessionId,
+        preview: parsed.preview,
+        importedFrom,
+      }
+      this.store.writeEvents(chatId, claudeTurnsToEvents(parsed, chatId, 0, 0))
+      this.store.saveMeta(meta)
+      this.chats.set(chatId, new Chat(this.store, meta, true).load())
+      chats.push(meta)
+      this.notifySnapshot(chatId)
+    }
+    if (chats.length) this.broadcastChats()
+    return { chats, skipped }
+  }
+
+  /** 已导入 Claude 会话的对话，按 sessionId 索引。 */
+  private importedChatsBySession(): Map<string, Chat> {
+    const out = new Map<string, Chat>()
+    for (const c of this.chats.values()) {
+      const imp = c.meta.importedFrom
+      if (imp?.source === 'claude') out.set(imp.sessionId, c)
+    }
+    return out
+  }
+
+  /** 重写事件日志后，让打开着这个对话的客户端重新拉一次快照。 */
+  private notifySnapshot(chatId: string): void {
+    const snapshot = this.snapshot(chatId)
+    if (!snapshot) return
+    for (const cl of this.clients.values()) if (cl.chatId === chatId) cl.send({ type: 'snapshot', snapshot })
   }
 
   // ---------- events ----------

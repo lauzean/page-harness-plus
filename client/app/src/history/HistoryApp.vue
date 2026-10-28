@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { ChatMeta, ServerMsg, TurnView } from '@shared/protocol'
+import type { ChatMeta, ClaudeSessionInfo, ServerMsg, TurnView } from '@shared/protocol'
 import { applyEvent } from '@shared/turns'
 import AgentBadge from '../components/AgentBadge.vue'
 import Icon from '../components/Icon.vue'
@@ -33,6 +33,19 @@ const now = ref(Date.now())
 const lightbox = ref<string | null>(null)
 const main = ref<HTMLElement>()
 const timer = setInterval(() => (now.value = Date.now()), 30_000)
+
+// Claude Code 会话同步面板
+const claudeOpen = ref(false)
+const claudeLoading = ref(false)
+const claudeSyncing = ref(false)
+const claudeSessions = ref<ClaudeSessionInfo[]>([])
+const claudeChecked = ref<string[]>([])
+const claudeHint = ref('')
+
+/** 需要导入或有更新的会话数量，用于按钮后的角标。 */
+const claudePending = computed(
+  () => claudeSessions.value.filter((s) => !s.continued && (!s.importedChatId || !s.upToDate)).length,
+)
 
 const sock = createSocket(
   (m: ServerMsg) => {
@@ -146,6 +159,87 @@ async function remove() {
   await refreshChats()
 }
 
+// ---------- Claude Code 会话同步 ----------
+
+/** 打开/关闭同步面板；打开时扫描一次会话目录。 */
+async function openClaudeSync() {
+  if (claudeOpen.value) {
+    claudeOpen.value = false
+    return
+  }
+  claudeOpen.value = true
+  claudeHint.value = ''
+  await loadClaudeSessions()
+}
+
+/** 读取当前项目的 Claude 会话，并默认勾选未导入或有更新的会话。 */
+async function loadClaudeSessions() {
+  claudeLoading.value = true
+  try {
+    const list = await api.get<ClaudeSessionInfo[]>('claude/sessions')
+    claudeSessions.value = list
+    claudeChecked.value = list.filter((s) => !s.continued && (!s.importedChatId || !s.upToDate)).map((s) => s.sessionId)
+  } catch (e) {
+    claudeHint.value = errText(e)
+  } finally {
+    claudeLoading.value = false
+  }
+}
+
+/** 同步选中的会话；完成后刷新列表和左侧对话列表。 */
+async function syncClaude(ids: string[]) {
+  if (!ids.length || claudeSyncing.value) return
+  claudeSyncing.value = true
+  claudeHint.value = ''
+  try {
+    const r = await api.post<{ chats: ChatMeta[]; skipped: Array<{ sessionId: string; reason: string }> }>('claude/sync', { ids })
+    claudeHint.value = r.chats.length ? fmt(t.value.claudeSynced, { n: r.chats.length }) : t.value.claudeNothing
+    if (r.skipped.some((s) => s.reason === 'continued')) claudeHint.value += ' ' + t.value.claudeContinuedHint
+    await loadClaudeSessions()
+    await refreshChats()
+    if (r.chats.length && !current.value) await select(r.chats[0].id)
+  } catch (e) {
+    claudeHint.value = errText(e)
+  } finally {
+    claudeSyncing.value = false
+  }
+}
+
+/** 同步默认勾选的会话。 */
+function syncSelected() {
+  void syncClaude(claudeChecked.value)
+}
+
+/** 一次导入所有未导入或有更新的会话。 */
+function syncAllClaude() {
+  void syncClaude(claudeSessions.value.filter((s) => !s.continued && (!s.importedChatId || !s.upToDate)).map((s) => s.sessionId))
+}
+
+/** 会话状态标签。 */
+function claudeStatus(s: ClaudeSessionInfo): { text: string; cls: string } {
+  if (s.continued) return { text: t.value.claudeContinued, cls: 'continued' }
+  if (!s.importedChatId) return { text: t.value.claudeNotImported, cls: 'new' }
+  if (s.upToDate) return { text: t.value.claudeImported, cls: 'synced' }
+  return { text: t.value.claudeStale, cls: 'stale' }
+}
+
+/** 打开已导入的对话。 */
+function openImported(s: ClaudeSessionInfo) {
+  if (!s.importedChatId) return
+  claudeOpen.value = false
+  void select(s.importedChatId)
+}
+
+/** 文件大小显示。 */
+function sizeOf(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`
+}
+
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
 const totals = computed(() => {
   let ms = 0
   let tok = 0
@@ -176,6 +270,10 @@ onBeforeUnmount(() => {
         <Icon name="search" />
         <input v-model="q" class="input" :placeholder="t.search" data-testid="history-search" />
       </div>
+      <button class="btn ghost sm claude-open" data-testid="claude-sync" @click="openClaudeSync">
+        <Icon name="download" />{{ t.claudeSync }}
+        <span v-if="claudePending" class="pend">{{ claudePending }}</span>
+      </button>
       <div v-if="hits" class="list">
         <div class="cnt faint">{{ searching ? '…' : hits.length ? fmt(t.results, { n: hits.length }) : t.noResults }}</div>
         <button v-for="(h, i) in hits" :key="i" class="item hit" @click="select(h.chatId, h.turnId || undefined)">
@@ -222,6 +320,46 @@ onBeforeUnmount(() => {
       </template>
       <div v-else class="center muted">{{ t.selectChat }}</div>
     </section>
+    <div v-if="claudeOpen" class="claude-mask" @click.self="claudeOpen = false">
+      <div class="claude-modal">
+        <header class="cm-head">
+          <div class="ttl">
+            <h1>{{ t.claudeSyncTitle }}</h1>
+            <div class="faint sub">{{ t.claudeSyncHint }}</div>
+          </div>
+          <button class="btn ghost icon sm" :title="t.close" @click="claudeOpen = false"><Icon name="x" /></button>
+        </header>
+        <div v-if="claudeLoading" class="center cm-center">
+          <span class="spin" />
+          <span class="faint">{{ t.claudeScanning }}</span>
+        </div>
+        <div v-else-if="!claudeSessions.length" class="center cm-center muted">{{ t.claudeNoSessions }}</div>
+        <div v-else class="cm-list">
+          <label v-for="s in claudeSessions" :key="s.sessionId" class="cm-row" :class="{ off: s.continued }">
+            <input v-model="claudeChecked" type="checkbox" :value="s.sessionId" :disabled="s.continued" />
+            <span class="cb">
+              <span class="ct">{{ s.title }}</span>
+              <span class="cmeta faint">
+                {{ relTime(s.updatedAt, now) }} · {{ fmt(t.turns, { n: s.turns }) }} · {{ sizeOf(s.sizeBytes) }}
+                <template v-if="s.gitBranch"> · {{ s.gitBranch }}</template>
+              </span>
+              <span v-if="s.preview" class="cprev">{{ s.preview }}</span>
+            </span>
+            <span class="chip" :class="claudeStatus(s).cls">{{ claudeStatus(s).text }}</span>
+            <button v-if="s.importedChatId" class="btn ghost sm" @click.prevent.stop="openImported(s)">{{ t.claudeOpenChat }}</button>
+          </label>
+        </div>
+        <footer class="cm-foot">
+          <span class="faint hint">{{ claudeHint || fmt(t.claudeSessionsFound, { n: claudeSessions.length }) }}</span>
+          <button class="btn sm" :disabled="!claudeChecked.length || claudeSyncing" @click="syncSelected">
+            {{ claudeSyncing ? t.claudeSyncing : fmt(t.claudeSyncSelected, { n: claudeChecked.length }) }}
+          </button>
+          <button class="btn primary sm" :disabled="!claudePending || claudeSyncing" @click="syncAllClaude">
+            {{ fmt(t.claudeImportAll, { n: claudePending }) }}
+          </button>
+        </footer>
+      </div>
+    </div>
     <div v-if="lightbox" class="lightbox" @click="lightbox = null"><img :src="lightbox" alt="" /></div>
   </div>
 </template>
@@ -259,4 +397,30 @@ main :deep(.turn.flash) { animation: flash 1.6s; }
 .older { display: flex; justify-content: center; padding: 8px; }
 .center { display: flex; align-items: center; justify-content: center; height: 100%; padding: 24px; }
 @media (max-width: 720px) { .hist { grid-template-columns: 1fr; } aside { max-height: 40vh; } }
+/* Claude 会话同步 */
+.claude-open { margin: 0 12px 8px; justify-content: flex-start; gap: 6px; position: relative; }
+.claude-open svg { width: 14px; height: 14px; }
+.pend { margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent); color: #fff; font-size: 11px; line-height: 18px; text-align: center; }
+.claude-mask { position: fixed; inset: 0; z-index: 50; background: rgba(0, 0, 0, 0.45); display: flex; align-items: center; justify-content: center; padding: 24px; }
+.claude-modal { width: min(880px, 100%); max-height: min(78vh, 760px); background: var(--bg); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35); display: flex; flex-direction: column; overflow: hidden; }
+.cm-head { display: flex; align-items: flex-start; gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--line); }
+.cm-head .ttl { flex: 1; min-width: 0; }
+.cm-head .sub { margin-top: 4px; font-size: 12px; line-height: 1.5; }
+.cm-center { flex: 1; flex-direction: column; gap: 10px; min-height: 200px; }
+.cm-list { flex: 1; overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 4px; }
+.cm-row { display: flex; align-items: center; gap: 10px; padding: 10px; border-radius: 10px; cursor: pointer; }
+.cm-row:hover { background: var(--bg2); }
+.cm-row.off { opacity: 0.6; cursor: default; }
+.cm-row input { flex: none; }
+.cb { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ct { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmeta { font-size: 11px; }
+.cprev { font-size: 12px; color: var(--fg2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip { flex: none; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--bg3); color: var(--fg2); }
+.chip.new { background: var(--accent-soft); color: var(--accent); }
+.chip.stale { background: color-mix(in srgb, #f59e0b 18%, transparent); color: #b45309; }
+.chip.synced { background: color-mix(in srgb, #10b981 16%, transparent); color: #047857; }
+.chip.continued { background: var(--bg3); }
+.cm-foot { display: flex; align-items: center; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--line); }
+.cm-foot .hint { flex: 1; min-width: 0; font-size: 12px; }
 </style>

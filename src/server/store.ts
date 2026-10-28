@@ -53,6 +53,13 @@ export class ChatStore {
     appendFileSync(path.join(d, 'events.jsonl'), JSON.stringify(ev) + '\n')
   }
 
+  /** Replaces a chat's event log. Used by Claude session imports, which carry their own seq/ts. */
+  writeEvents(chatId: string, events: ChatEvent[]): void {
+    const d = this.dir(chatId)
+    mkdirSync(d, { recursive: true })
+    writeFileSync(path.join(d, 'events.jsonl'), events.map((e) => JSON.stringify(e) + '\n').join(''))
+  }
+
   readEvents(chatId: string): ChatEvent[] {
     const file = path.join(this.dir(chatId), 'events.jsonl')
     if (!existsSync(file)) return []

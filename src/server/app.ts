@@ -611,6 +611,14 @@ function createApi(o: AppOptions) {
       if (!b && m === 'GET') return json(res, registry.list())
       if (b && c === 'models' && m === 'GET') return json(res, await registry.models(b))
     }
+    if (a === 'claude' && b === 'sessions' && !c && m === 'GET') {
+      return json(res, await gateway.listClaudeSessions())
+    }
+    if (a === 'claude' && b === 'sync' && !c && m === 'POST') {
+      const body = await readJsonBody<{ ids?: unknown }>(req)
+      const ids = Array.isArray(body.ids) ? body.ids.filter((x): x is string => typeof x === 'string' && !!x) : undefined
+      return json(res, await gateway.syncClaudeSessions(ids))
+    }
     if (a === 'chats') {
       if (!b && m === 'GET') return json(res, gateway.listChats())
       if (!b && m === 'POST') {
