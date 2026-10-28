@@ -5,6 +5,7 @@ import { LIVE_VERSION, PAGE_CONTROL_VERSION, type Lang, type LiveSession, type P
 import { followLayout, inViewport, makeWindow, pickOf, placeWindow, selectorFor } from '../shared/dom'
 import { defaultLang, pageStrings } from '../shared/i18n-page'
 import type { PageHost } from '../shared/page-host'
+import { pickToMarkdown } from '../shared/pick-text'
 import { startDirectReview } from './direct'
 import { installRelay } from './relay'
 import { panelWatchAdvance, panelWatchDelay, panelWatchIdle } from './panel-watch'
@@ -46,6 +47,30 @@ function tabId(): string {
     store.set(sessionStorage, 'ph:tab', id)
   }
   return id
+}
+
+/**
+ * 写入剪贴板。HTTPS 或 localhost 下用 navigator.clipboard；
+ * 其余情况（例如通过局域网 IP 打开的页面）退回隐藏 textarea + execCommand。
+ */
+async function writeClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {}
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    const ok = document.execCommand('copy')
+    ta.remove()
+    return ok
+  } catch {
+    return false
+  }
 }
 
 function siteHost(): string {
@@ -214,6 +239,11 @@ function init() {
     toastEl.hidden = false
     clearTimeout(toastTimer)
     toastTimer = window.setTimeout(() => (toastEl.hidden = true), 2500)
+  }
+  /** 复制取点内容，供用户粘贴到其他 IDE 的对话里。 */
+  const copyPick = async (pick: Pick) => {
+    const ok = await writeClipboard(pickToMarkdown(pick))
+    toast(ok ? 'ok' : 'warn', ok ? t.pickCopied : t.copyFailed)
   }
 
   const applyTheme = () => {
@@ -417,6 +447,14 @@ function init() {
           showHl(null)
         }),
       )
+    // 复制独立于 Agent：评审模式、书签模式下也能把元素信息带到其他 IDE。
+    buttons.push(
+      act('copy', t.pickCopy, () => {
+        closePickBar()
+        showHl(null)
+        void copyPick(pickOf(el))
+      }),
+    )
     buttons.push(act('comment', t.comment, done(() => review.comment(el)), 'primary-soft'))
     if (review.canEdit()) buttons.push(act('edit', t.edit, done(() => review.edit(el)), 'primary-soft'))
     if (!reviewer && !noAgent && liveOn && window.__phLive) buttons.push(act('live', t.pickLive, () => window.__phLive?.design(el), 'primary'))

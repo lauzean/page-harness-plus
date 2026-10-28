@@ -267,6 +267,42 @@ export interface ChatMeta {
   turns: number
   agentSessionId?: string
   preview?: string
+  /** Set when this chat mirrors a Claude Code transcript; the chat can be re-synced from it. */
+  importedFrom?: ChatImport
+}
+
+/** A Claude Code session transcript imported into the chat history. */
+export interface ChatImport {
+  source: 'claude'
+  sessionId: string
+  /** Absolute path of the .jsonl transcript, used for re-sync. */
+  file: string
+  sizeBytes: number
+  mtimeMs: number
+  /** Number of turns written by the import. More turns in the chat means it was continued here. */
+  turns: number
+  syncedAt: number
+}
+
+/** A Claude Code session discovered on disk, for the history page's sync panel. */
+export interface ClaudeSessionInfo {
+  sessionId: string
+  title: string
+  preview?: string
+  createdAt: number
+  updatedAt: number
+  turns: number
+  sizeBytes: number
+  cwd?: string
+  gitBranch?: string
+  /** Chat already imported from this session. */
+  importedChatId?: string
+  /** Turns written by the previous import. */
+  importedTurns?: number
+  /** The transcript has not changed since the import. */
+  upToDate: boolean
+  /** The chat has turns added in Page Harness, so re-syncing would overwrite them. */
+  continued: boolean
 }
 
 export interface AgentInfo {
